@@ -1,0 +1,306 @@
+name: iceberg-ops
+
+x-hadoop-environment: &hadoop-environment
+  HADOOP_HOME: /opt/hadoop
+  CORE-SITE.XML_fs.defaultFS: hdfs://namenode:8020
+  HDFS-SITE.XML_dfs.namenode.rpc-address: namenode:8020
+  HDFS-SITE.XML_dfs.namenode.name.dir: /data/name
+  HDFS-SITE.XML_dfs.datanode.data.dir: /data/data
+  HDFS-SITE.XML_dfs.replication: "1"
+  HDFS-SITE.XML_dfs.permissions.enabled: "false"
+  HDFS-SITE.XML_dfs.client.use.datanode.hostname: "true"
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-iceberg_ops}
+      POSTGRES_USER: ${POSTGRES_USER:-iceberg_ops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-iceberg_ops}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - iceberg_ops_postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-demo}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iceberg_ops}:${POSTGRES_PASSWORD:-iceberg_ops}@postgres:5432/${POSTGRES_DB:-iceberg_ops}
+      DEMO_DATA: ${DEMO_DATA:-true}
+      CORS_ALLOWED_ORIGINS: http://localhost:${WEB_PORT:-3000}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      PLAYGROUND_ENABLED: ${PLAYGROUND_ENABLED:-true}
+      PLAYGROUND_RUNNER_URL: http://playground-runner:8090
+      PLAYGROUND_TIMEOUT_SECONDS: ${PLAYGROUND_TIMEOUT_SECONDS:-120}
+      PLAYGROUND_RUNNER_TOKEN: ${PLAYGROUND_RUNNER_TOKEN:-local-playground-token}
+    ports:
+      - "${API_PORT:-8088}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8080
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  operation-worker:
+    build:
+      context: ./backend
+    profiles: ["playground"]
+    entrypoint: ["python", "-m", "app.worker"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-demo}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iceberg_ops}:${POSTGRES_PASSWORD:-iceberg_ops}@postgres:5432/${POSTGRES_DB:-iceberg_ops}
+      PLAYGROUND_RUNNER_URL: http://playground-runner:8090
+      PLAYGROUND_RUNNER_TOKEN: ${PLAYGROUND_RUNNER_TOKEN:-local-playground-token}
+      SPARK_EXECUTION_MODE: livy
+      SPARK_CATALOG_SCOPE: playground
+      SPARK_ENGINE_NAME: spark-playground
+      LIVY_URL: http://livy:8998
+      LIVY_JOB_FILE: local:/opt/iceberg-ops/jobs/iceberg_maintenance.py
+      LIVY_POLL_SECONDS: ${LIVY_POLL_SECONDS:-2}
+      LIVY_REQUEST_TIMEOUT_SECONDS: ${LIVY_REQUEST_TIMEOUT_SECONDS:-30}
+      LIVY_VERIFY_TLS: "false"
+      LIVY_DRIVER_MEMORY: 1g
+      LIVY_EXECUTOR_MEMORY: 1g
+      LIVY_CONF_JSON: >-
+        {"spark.driver.host":"livy","spark.driver.bindAddress":"0.0.0.0","spark.driver.port":"39100","spark.blockManager.port":"39101","spark.cores.max":"1","spark.executor.cores":"1","spark.sql.shuffle.partitions":"2","spark.sql.extensions":"org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions","spark.sql.catalog.playground":"org.apache.iceberg.spark.SparkCatalog","spark.sql.catalog.playground.type":"hadoop","spark.sql.catalog.playground.warehouse":"hdfs://namenode:8020/warehouse","spark.hadoop.fs.defaultFS":"hdfs://namenode:8020","spark.hadoop.dfs.client.use.datanode.hostname":"true"}
+      OPERATION_WORKER_POLL_SECONDS: ${OPERATION_WORKER_POLL_SECONDS:-2}
+      OPERATION_WORKER_TIMEOUT_SECONDS: ${OPERATION_WORKER_TIMEOUT_SECONDS:-1800}
+    depends_on:
+      backend:
+        condition: service_healthy
+      livy:
+        condition: service_healthy
+    restart: unless-stopped
+
+  bulk-worker:
+    build:
+      context: ./backend
+    profiles: ["playground"]
+    entrypoint: ["python", "-m", "app.bulk_worker"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-demo}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iceberg_ops}:${POSTGRES_PASSWORD:-iceberg_ops}@postgres:5432/${POSTGRES_DB:-iceberg_ops}
+      PLAYGROUND_ENABLED: "true"
+      PLAYGROUND_RUNNER_URL: http://playground-runner:8090
+      PLAYGROUND_TIMEOUT_SECONDS: ${PLAYGROUND_TIMEOUT_SECONDS:-120}
+      BULK_WORKER_POLL_SECONDS: ${BULK_WORKER_POLL_SECONDS:-1}
+      OPERATION_WORKER_STALE_SECONDS: ${OPERATION_WORKER_STALE_SECONDS:-7200}
+    depends_on:
+      backend:
+        condition: service_healthy
+      playground-runner:
+        condition: service_healthy
+    restart: unless-stopped
+
+  livy-worker:
+    build:
+      context: ./backend
+    profiles: ["livy"]
+    entrypoint: ["python", "-m", "app.worker"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-iceberg_ops}:${POSTGRES_PASSWORD:-iceberg_ops}@postgres:5432/${POSTGRES_DB:-iceberg_ops}
+      SPARK_EXECUTION_MODE: livy
+      SPARK_CATALOG_SCOPE: production
+      SPARK_ENGINE_NAME: ${SPARK_ENGINE_NAME:-spark-production}
+      LIVY_URL: ${LIVY_URL:-http://livy:8998}
+      LIVY_JOB_FILE: ${LIVY_JOB_FILE:-hdfs:///apps/iceberg-ops/iceberg_maintenance.py}
+      LIVY_POLL_SECONDS: ${LIVY_POLL_SECONDS:-5}
+      LIVY_REQUEST_TIMEOUT_SECONDS: ${LIVY_REQUEST_TIMEOUT_SECONDS:-30}
+      LIVY_VERIFY_TLS: ${LIVY_VERIFY_TLS:-true}
+      LIVY_CA_BUNDLE: ${LIVY_CA_BUNDLE:-}
+      LIVY_USERNAME: ${LIVY_USERNAME:-}
+      LIVY_PASSWORD: ${LIVY_PASSWORD:-}
+      LIVY_BEARER_TOKEN: ${LIVY_BEARER_TOKEN:-}
+      LIVY_PROXY_USER: ${LIVY_PROXY_USER:-}
+      LIVY_QUEUE: ${LIVY_QUEUE:-}
+      LIVY_DRIVER_MEMORY: ${LIVY_DRIVER_MEMORY:-}
+      LIVY_EXECUTOR_MEMORY: ${LIVY_EXECUTOR_MEMORY:-}
+      LIVY_NUM_EXECUTORS: ${LIVY_NUM_EXECUTORS:-}
+      LIVY_CONF_JSON: '${LIVY_CONF_JSON:-{}}'
+      OPERATION_WORKER_POLL_SECONDS: ${OPERATION_WORKER_POLL_SECONDS:-2}
+      OPERATION_WORKER_TIMEOUT_SECONDS: ${OPERATION_WORKER_TIMEOUT_SECONDS:-1800}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  hdfs-init:
+    image: ghcr.io/apache/hadoop:3.5.0
+    profiles: ["playground"]
+    user: "0:0"
+    entrypoint: ["sh", "-c"]
+    command: ["mkdir -p /data/name /data/data && chown -R 1001:100 /data/name /data/data"]
+    volumes:
+      - playground_hdfs_namenode:/data/name
+      - playground_hdfs_datanode:/data/data
+    restart: "no"
+
+  namenode:
+    image: ghcr.io/apache/hadoop:3.5.0
+    profiles: ["playground"]
+    hostname: namenode
+    command: ["hdfs", "namenode"]
+    environment:
+      <<: *hadoop-environment
+      ENSURE_NAMENODE_DIR: /data/name/current
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HDFS_UI_PORT:-9870}:9870"
+    volumes:
+      - playground_hdfs_namenode:/data/name
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -fs hdfs://namenode:8020 -report >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  datanode:
+    image: ghcr.io/apache/hadoop:3.5.0
+    profiles: ["playground"]
+    hostname: datanode
+    command: ["hdfs", "datanode"]
+    environment:
+      <<: *hadoop-environment
+    volumes:
+      - playground_hdfs_datanode:/data/data
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "hdfs dfsadmin -fs hdfs://namenode:8020 -report 2>/dev/null | grep -q 'Live datanodes (1)'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  spark-master:
+    image: iceberg-ops/playground-spark:0.1.0
+    build:
+      context: ./playground/spark
+    profiles: ["playground"]
+    hostname: spark-master
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${SPARK_MASTER_UI_PORT:-19090}:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('spark-master', 7077), 2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  spark-worker:
+    image: iceberg-ops/playground-spark:0.1.0
+    build:
+      context: ./playground/spark
+    profiles: ["playground"]
+    hostname: spark-worker
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8081"
+      - --cores
+      - "2"
+      - --memory
+      - 2g
+      - spark://spark-master:7077
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${SPARK_WORKER_UI_PORT:-19091}:8081"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('spark-worker', 8081), 2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  livy:
+    image: iceberg-ops/playground-livy:0.1.0
+    build:
+      context: .
+      dockerfile: playground/livy/Dockerfile
+    profiles: ["playground"]
+    hostname: livy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PLAYGROUND_LIVY_PORT:-18998}:8998"
+    depends_on:
+      datanode:
+        condition: service_healthy
+      spark-worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8998/batches?from=0&size=1')"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+
+  playground-runner:
+    image: iceberg-ops/playground-spark:0.1.0
+    build:
+      context: ./playground/spark
+    profiles: ["playground"]
+    hostname: playground-runner
+    environment:
+      SPARK_LOCAL_IP: playground-runner
+      PLAYGROUND_RUNNER_TOKEN: ${PLAYGROUND_RUNNER_TOKEN:-local-playground-token}
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PLAYGROUND_RUNNER_PORT:-8090}:8090"
+    depends_on:
+      datanode:
+        condition: service_healthy
+      spark-worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  iceberg_ops_postgres:
+  playground_hdfs_namenode:
+  playground_hdfs_datanode:
